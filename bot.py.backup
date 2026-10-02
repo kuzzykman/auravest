@@ -1,0 +1,1864 @@
+import sqlite3
+import uuid
+import requests
+from datetime import datetime, timedelta
+import random
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+TOKEN = "8937890972:AAGLKL_gKyRbfFzx1XpCVws9Xy3T_Sv_npU"
+
+# Put YOUR Telegram numeric ID here
+ADMIN_ID = 8687053821
+
+CUSTOMER_SERVICE = "https://t.me/aurapayservice1"
+
+# Flutterwave
+FLW_PUBLIC_KEY = "FLWPUBK-bc372e26aa4b2655503a0708054e0878-X"
+FLW_SECRET_KEY = "FLWSECK-50b13101e87aa35daef4edb4e62dd6ec-19f4dd0fb12vt-X"
+
+# Manual deposit
+MANUAL_BANK = "Moremonee"
+MANUAL_ACCOUNT_NUMBER = "7072620688"
+MANUAL_ACCOUNT_NAME = "Israel Oyenekan"
+
+# Withdrawal
+MIN_WITHDRAWAL = 700
+WITHDRAWAL_FEE = 18
+
+# Plans
+PLANS = [
+    500,
+    1000,
+    2000,
+    4000,
+    8000,
+    12000,
+    20000,
+    30000,
+    50000,
+]
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+DB = "auravest.db"
+
+def db():
+    return sqlite3.connect(DB)
+
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS plan_purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            created_at TEXT,
+            daily_income REAL DEFAULT 0,
+            last_income TEXT,
+            expires_at TEXT,
+            total_earned REAL DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            fee REAL,
+            net_amount REAL,
+            bank_name TEXT,
+            account_number TEXT,
+            account_name TEXT,
+            status TEXT,
+            created_at TEXT
+        )
+    """)
+
+    # Add welcome bonus and daily check-in fields
+    cur.execute("PRAGMA table_info(users)")
+    columns = [row[1] for row in cur.fetchall()]
+
+    if "welcome_bonus_claimed" not in columns:
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN welcome_bonus_claimed INTEGER DEFAULT 0
+        """)
+
+    if "last_checkin" not in columns:
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN last_checkin TEXT
+        """)
+
+    conn.commit()
+
+    conn.commit()
+    conn.close()
+
+def db():
+    return sqlite3.connect(DB)
+
+
+def setup_database():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            deposit_balance REAL DEFAULT 0,
+            income_balance REAL DEFAULT 0,
+            referrer_id INTEGER,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            tx_ref TEXT,
+            amount REAL,
+            type TEXT,
+            status TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS deposits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            method TEXT,
+            screenshot_file_id TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS plan_purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            created_at TEXT,
+            daily_income REAL DEFAULT 0,
+            last_income TEXT,
+            expires_at TEXT,
+            total_earned REAL DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            fee REAL,
+            net_amount REAL,
+            bank_name TEXT,
+            account_number TEXT,
+            account_name TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# USER FUNCTIONS
+# =========================================================
+
+def create_user(user, referrer_id=None):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user.id,)
+    )
+
+    exists = cur.fetchone()
+
+    if not exists:
+        cur.execute("""
+            INSERT INTO users
+            (
+                user_id,
+                username,
+                first_name,
+                income_balance,
+                referrer_id,
+                created_at,
+                welcome_bonus_claimed
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            400,
+            referrer_id,
+            datetime.now().isoformat(),
+            1
+        ))
+
+    conn.commit()
+    conn.close()
+
+def get_user(user_id):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, username, first_name,
+               deposit_balance, income_balance, referrer_id
+        FROM users
+        WHERE user_id = ?
+    """, (user_id,))
+
+    row = cur.fetchone()
+    conn.close()
+
+    return row
+
+async def daily_checkin(query):
+    user_id = query.from_user.id
+    user = get_user(user_id)
+
+    if not user:
+        await query.answer("Account not found.", show_alert=True)
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT last_checkin FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    row = cur.fetchone()
+
+    last_checkin = row[0] if row else None
+
+    if last_checkin:
+        last_time = datetime.fromisoformat(last_checkin)
+        elapsed = datetime.now() - last_time
+
+        if elapsed < timedelta(hours=24):
+            remaining = timedelta(hours=24) - elapsed
+            hours = int(remaining.total_seconds() // 3600)
+            minutes = int((remaining.total_seconds() % 3600) // 60)
+
+            conn.close()
+
+            await query.answer(
+                f"⏳ Come back in {hours}h {minutes}m.",
+                show_alert=True
+            )
+            return
+
+    reward = random.randint(60, 100)
+
+    cur.execute("""
+        UPDATE users
+        SET income_balance = income_balance + ?,
+            last_checkin = ?
+        WHERE user_id = ?
+    """, (
+        reward,
+        datetime.now().isoformat(),
+        user_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await query.edit_message_text(
+        f"🎁 Daily Check-in\n\n"
+        f"Congratulations! 🎉\n\n"
+        f"You received ₦{reward:,.2f}\n"
+        f"The reward has been added to your Income Balance.\n\n"
+        f"⏰ You can check in again after 24 hours.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Main Menu",
+                    callback_data="home"
+                )
+            ]
+        ])
+    )
+
+def add_deposit_balance(user_id, amount):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE users
+        SET deposit_balance = deposit_balance + ?
+        WHERE user_id = ?
+    """, (amount, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def add_income_balance(user_id, amount):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE users
+        SET income_balance = income_balance + ?
+        WHERE user_id = ?
+    """, (amount, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# MAIN MENU
+# =========================================================
+async def delete_old_prompt(context):
+    message_id = context.user_data.pop("prompt_message_id", None)
+
+    if message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=context.user_data["chat_id"],
+                message_id=message_id
+            )
+        except Exception:
+            pass
+
+def admin_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Overview", callback_data="admin_overview"),
+            InlineKeyboardButton("👥 Users", callback_data="admin_users"),
+        ],
+        [
+            InlineKeyboardButton("💰 Deposits", callback_data="admin_deposits"),
+            InlineKeyboardButton("💸 Withdrawals", callback_data="admin_withdrawals"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data="home"),
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+def main_menu():
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "💰 My Balance",
+                callback_data="balance"
+            ),
+            InlineKeyboardButton(
+                "💳 Deposit",
+                callback_data="deposit"
+            ),
+        ],
+
+[
+    InlineKeyboardButton(
+        "📦 Plans",
+        callback_data="plans"
+    ),
+    InlineKeyboardButton(
+        "📦 Orders",
+        callback_data="orders"
+    ),
+],
+
+        [
+            InlineKeyboardButton(
+                "👥 Refer & Earn",
+                callback_data="refer"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🎁 Daily Check-in",
+                callback_data="daily_checkin"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 Join AuraVest Channel",
+                url="https://t.me/auravest1"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🎧 Customer Service",
+                url=CUSTOMER_SERVICE
+            ),
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    referrer_id = None
+
+    if context.args:
+        try:
+            possible_ref = int(context.args[0])
+
+            if possible_ref != user.id:
+                referrer_id = possible_ref
+
+        except ValueError:
+            pass
+
+    create_user(user, referrer_id)
+
+    text = f"""
+🌐 Welcome to AuraVest
+
+Hello {user.first_name} 👋
+
+Your AuraVest account is ready.
+
+Use the menu below to manage your account.
+"""
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_menu()
+    )
+
+
+# =========================================================
+# BALANCE
+# =========================================================
+
+async def show_balance(query):
+
+    user = get_user(query.from_user.id)
+
+    if not user:
+        return
+
+    deposit_balance = user[3]
+    income_balance = user[4]
+
+    text = f"""
+💰 YOUR BALANCE
+
+💳 Deposit Balance:
+₦{deposit_balance:,.2f}
+
+💵 Income Balance:
+₦{income_balance:,.2f}
+
+Deposit Balance is used for plan purchases.
+
+Income Balance is the balance available for withdrawal.
+"""
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="home"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# DEPOSIT MENU
+# =========================================================
+
+async def show_deposit_menu(query):
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⚡ Automatic Deposit",
+                callback_data="automatic_deposit"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏦 Manual Deposit",
+                callback_data="manual_deposit"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="home"
+            )
+        ],
+    ]
+
+    await query.edit_message_text(
+        "💳 Choose your deposit method:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================================================
+# AUTOMATIC DEPOSIT
+# =========================================================
+
+async def create_flutterwave_payment(user_id, amount):
+    tx_ref = f"AURAVEST-{user_id}-{uuid.uuid4().hex[:10]}"
+
+    url = "https://api.flutterwave.com/v3/payments"
+
+    headers = {
+        "Authorization": f"Bearer {FLW_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "tx_ref": tx_ref,
+        "amount": amount,
+        "currency": "NGN",
+        "redirect_url": "https://example.com/payment-complete",
+        "customer": {
+            "email": "abidekontop@gmail.com",
+            "name": "AuraVest User",
+        },
+        "customizations": {
+            "title": "AuraVest Deposit",
+            "description": f"Deposit ₦{amount:,.2f}",
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        print("FLUTTERWAVE STATUS:", response.status_code)
+        print("FLUTTERWAVE RESPONSE:", response.text)
+
+        data = response.json()
+
+        if response.status_code == 200:
+            link = data["data"]["link"]
+            return link, tx_ref
+
+        return None, tx_ref
+
+    except Exception as e:
+        print("FLUTTERWAVE ERROR:", e)
+        return None, tx_ref
+
+async def automatic_deposit(query, context):
+    message = await query.edit_message_text(
+        "💳 Enter the amount you want to deposit.\n\n"
+        "Example: 5000"
+    )
+
+    context.user_data["prompt_message_id"] = message.message_id
+    context.user_data["prompt_chat_id"] = message.chat_id
+
+async def create_flutterwave_payment(user_id, amount):
+    tx_ref = f"AURAVEST-{user_id}-{uuid.uuid4().hex[:10]}"
+
+    url = "https://api.flutterwave.com/v3/payments"
+
+    headers = {
+        "Authorization": f"Bearer {FLW_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "tx_ref": tx_ref,
+        "amount": amount,
+        "currency": "NGN",
+        "redirect_url": "https://example.com/payment-complete",
+        "customer": {
+"email": "abidekontop@gmail.com",            "name": "AuraVest User",
+        },
+        "customizations": {
+            "title": "AuraVest Deposit",
+            "description": f"Deposit ₦{amount:,.2f}",
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        print("FLUTTERWAVE STATUS:", response.status_code)
+        print("FLUTTERWAVE RESPONSE:", response.text)
+
+        data = response.json()
+
+        if response.status_code == 200:
+            link = data["data"]["link"]
+            return link, tx_ref
+
+        return None, tx_ref
+
+    except Exception as e:
+        print("FLUTTERWAVE ERROR:", e)
+        return None, tx_ref
+
+async def automatic_amount(update, context):
+
+    if not update.message:
+        return
+
+    try:
+        amount = float(update.message.text.replace(",", ""))
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Enter a valid amount.\nExample: 5000"
+        )
+        return
+
+    if amount <= 0:
+        await update.message.reply_text(
+            "❌ Amount must be greater than zero."
+        )
+        return
+
+    user_id = update.effective_user.id
+
+    link, tx_ref = await create_flutterwave_payment(
+        user_id,
+        amount
+    )
+
+    if not link:
+        await update.message.reply_text(
+            "❌ Unable to create payment right now.\n"
+            "Please try again or use Manual Deposit."
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO transactions
+        (user_id, tx_ref, amount, type, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        tx_ref,
+        amount,
+        "automatic_deposit",
+        "pending",
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "💳 Pay Now",
+                url=link
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="deposit"
+            )
+        ],
+    ]
+
+    await update.message.reply_text(
+        f"💳 Deposit Amount: ₦{amount:,.2f}\n\n"
+        "Click Pay Now to continue.\n\n"
+        "Your balance will only be credited after successful "
+        "payment verification.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================================================
+# MANUAL DEPOSIT
+# =========================================================
+
+async def manual_deposit(query):
+
+    text = f"""
+🏦 MANUAL DEPOSIT
+
+Bank: {MANUAL_BANK}
+Account Number: {MANUAL_ACCOUNT_NUMBER}
+Account Name: {MANUAL_ACCOUNT_NAME}
+
+Send your payment to the account above.
+
+After payment, enter the exact amount you paid.
+"""
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "💵 Enter Amount",
+                    callback_data="manual_amount"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="deposit"
+                )
+            ],
+        ])
+    )
+
+
+# =========================================================
+# PLANS
+# =========================================================
+async def show_orders(query):
+    user_id = query.from_user.id
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT amount, daily_income, created_at,
+               expires_at, total_earned
+        FROM plan_purchases
+        WHERE user_id = ?
+        ORDER BY id DESC
+    """, (user_id,))
+
+    orders = cur.fetchall()
+    conn.close()
+
+    if not orders:
+        await query.edit_message_text(
+            "📦 My Orders\n\n"
+            "You have not purchased any plan yet.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📦 View Plans",
+                        callback_data="plans"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Main Menu",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+        return
+
+    message = "📦 MY ORDERS\n\n"
+
+    for i, order in enumerate(orders, 1):
+        amount, daily_income, created_at, expires_at, total_earned = order
+
+        start_date = datetime.fromisoformat(created_at)
+        expiry_date = datetime.fromisoformat(expires_at)
+
+        remaining = expiry_date - datetime.now()
+
+        if remaining.total_seconds() > 0:
+            days = remaining.days
+            hours = remaining.seconds // 3600
+            time_remaining = f"{days} days, {hours} hours"
+        else:
+            time_remaining = "Expired"
+
+        message += (
+            f"📦 Order #{i}\n"
+            f"💰 Plan: ₦{amount:,.2f}\n"
+            f"💵 Daily Income: ₦{daily_income:,.2f}\n"
+            f"📈 Total Earned: ₦{total_earned:,.2f}\n"
+            f"📅 Started: {start_date.strftime('%d/%m/%Y')}\n"
+            f"⏳ Time Remaining: {time_remaining}\n\n"
+        )
+
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Main Menu",
+                    callback_data="home"
+                )
+            ]
+        ])
+    )
+async def show_plans(query):
+
+    keyboard = []
+
+    for amount in PLANS:
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"₦{amount:,}",
+                callback_data=f"plan_{amount}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "⬅️ Back",
+            callback_data="home"
+        )
+    ])
+
+    await query.edit_message_text(
+        "📦 AVAILABLE PLANS\n\n"
+        "Select a plan below.\n\n"
+        "Plan purchases use your Deposit Balance.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def buy_plan(query, amount):
+
+    user = get_user(query.from_user.id)
+
+    if not user:
+        return
+
+    balance = user[3]
+
+    if balance < amount:
+
+        await query.edit_message_text(
+            f"❌ Insufficient Deposit Balance.\n\n"
+            f"Plan: ₦{amount:,.2f}\n"
+            f"Your Balance: ₦{balance:,.2f}",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💳 Deposit",
+                        callback_data="deposit"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="plans"
+                    )
+                ],
+            ])
+        )
+
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE users
+        SET deposit_balance = deposit_balance - ?
+        WHERE user_id = ?
+    """, (amount, query.from_user.id))
+
+    daily_income = amount * 0.30
+    start_date = datetime.now()
+    expiry_date = start_date + timedelta(days=365)
+
+    cur.execute("""
+        INSERT INTO plan_purchases
+        (
+            user_id,
+            amount,
+            created_at,
+            daily_income,
+            last_income,
+            expires_at,
+            total_earned
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        query.from_user.id,
+        amount,
+        start_date.isoformat(),
+        daily_income,
+        start_date.isoformat(),
+        expiry_date.isoformat(),
+        0
+    ))
+    conn.close()
+
+    await query.edit_message_text(
+        f"✅ Plan Purchase Successful\n\n"
+        f"Plan Amount: ₦{amount:,.2f}\n\n"
+        "Your plan purchase has been recorded.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="home"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# REFERRAL
+# =========================================================
+
+async def show_referral(query):
+
+    user_id = query.from_user.id
+
+    bot_username = context_bot_username = (
+        await query.get_bot().get_me()
+    ).username
+
+    link = f"https://t.me/{bot_username}?start={user_id}"
+
+    text = f"""
+👥 REFER & EARN
+
+Your referral link:
+
+{link}
+
+Referral Bonus: 25%
+
+Share your link with people who want to join AuraVest.
+"""
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="home"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# WITHDRAWAL
+# =========================================================
+
+async def withdrawal_start(query):
+
+    user = get_user(query.from_user.id)
+
+    balance = user[4]
+
+    await query.edit_message_text(
+        f"""
+💸 WITHDRAWAL
+
+Available Income Balance:
+₦{balance:,.2f}
+
+Minimum withdrawal: ₦{MIN_WITHDRAWAL:,}
+
+Withdrawal fee: {WITHDRAWAL_FEE}%
+
+Enter the amount you want to withdraw.
+"""
+    )
+
+
+async def withdrawal_amount(update, context):
+
+    try:
+        amount = float(update.message.text.replace(",", ""))
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Enter a valid withdrawal amount."
+        )
+        return
+
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+
+    balance = user[4]
+
+    if amount < MIN_WITHDRAWAL:
+        await update.message.reply_text(
+            f"❌ Minimum withdrawal is ₦{MIN_WITHDRAWAL:,}."
+        )
+        return
+
+    if amount > balance:
+        await update.message.reply_text(
+            "❌ Insufficient Income Balance."
+        )
+        return
+
+    fee = amount * WITHDRAWAL_FEE / 100
+    net = amount - fee
+
+    context.user_data["withdraw_amount"] = amount
+    context.user_data["withdraw_fee"] = fee
+    context.user_data["withdraw_net"] = net
+
+    await update.message.reply_text(
+        f"""
+💸 Withdrawal Request
+
+Amount: ₦{amount:,.2f}
+Fee ({WITHDRAWAL_FEE}%): ₦{fee:,.2f}
+You receive: ₦{net:,.2f}
+
+Now send your bank details in this format:
+
+Bank Name
+Account Number
+Account Name
+"""
+    )
+
+
+async def withdrawal_details(update, context):
+
+    if "withdraw_amount" not in context.user_data:
+        return
+
+    lines = update.message.text.split("\n")
+
+    if len(lines) < 3:
+
+        await update.message.reply_text(
+            "❌ Please send your details exactly like this:\n\n"
+            "Bank Name\n"
+            "Account Number\n"
+            "Account Name"
+        )
+
+        return
+
+    bank_name = lines[0].strip()
+    account_number = lines[1].strip()
+    account_name = lines[2].strip()
+
+    amount = context.user_data["withdraw_amount"]
+    fee = context.user_data["withdraw_fee"]
+    net = context.user_data["withdraw_net"]
+
+    user_id = update.effective_user.id
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE users
+        SET income_balance = income_balance - ?
+        WHERE user_id = ?
+    """, (amount, user_id))
+
+    cur.execute("""
+        INSERT INTO withdrawals
+        (user_id, amount, fee, net_amount,
+         bank_name, account_number, account_name,
+         status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        amount,
+        fee,
+        net,
+        bank_name,
+        account_number,
+        account_name,
+        "pending",
+        datetime.now().isoformat()
+    ))
+
+    withdrawal_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"""
+✅ Withdrawal Request Submitted
+
+Amount: ₦{amount:,.2f}
+Fee: ₦{fee:,.2f}
+Net Amount: ₦{net:,.2f}
+
+Withdrawal ID: #{withdrawal_id}
+
+Your withdrawal is pending admin processing.
+Withdrawal processing terms are shown here before submission.
+""",
+        reply_markup=main_menu()
+    )
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"""
+🔔 NEW WITHDRAWAL
+
+ID: #{withdrawal_id}
+User ID: {user_id}
+
+Amount: ₦{amount:,.2f}
+Fee: ₦{fee:,.2f}
+Net: ₦{net:,.2f}
+
+Bank: {bank_name}
+Account: {account_number}
+Name: {account_name}
+""",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "✅ Approve",
+                    callback_data=f"approve_withdraw_{withdrawal_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Reject",
+                    callback_data=f"reject_withdraw_{withdrawal_id}"
+                ),
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ADMIN DASHBOARD
+# =========================================================
+
+async def admin(update, context):
+
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text(
+            "❌ Admin access only."
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📊 Overview",
+                callback_data="admin_overview"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 Pending Deposits",
+                callback_data="admin_deposits"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💸 Pending Withdrawals",
+                callback_data="admin_withdrawals"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Users",
+                callback_data="admin_users"
+            )
+        ],
+    ]
+
+    await update.message.reply_text(
+        "🔐 AURAVEST ADMIN DASHBOARD",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_overview(query):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM deposits
+        WHERE status = 'pending'
+    """)
+    pending_deposits = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM withdrawals
+        WHERE status = 'pending'
+    """)
+    pending_withdrawals = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(deposit_balance), 0),
+            COALESCE(SUM(income_balance), 0)
+        FROM users
+    """)
+    balances = cur.fetchone()
+
+    conn.close()
+
+    text = (
+        "📊 Admin Overview\n\n"
+        f"👥 Users: {users}\n"
+        f"🏦 Pending Deposits: {pending_deposits}\n"
+        f"💸 Pending Withdrawals: {pending_withdrawals}\n"
+        f"💳 Total Deposit Balance: ₦{balances[0]:,.2f}\n"
+        f"💵 Total Income Balance: ₦{balances[1]:,.2f}"
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+async def admin_users(query):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, telegram_id, username, deposit_balance, income_balance
+        FROM users
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+    users = cur.fetchall()
+    conn.close()
+
+    if not users:
+        text = "👥 Users\n\nNo users found."
+    else:
+        text = "👥 Recent Users\n\n"
+
+        for user in users:
+            text += (
+                f"ID: {user[0]}\n"
+                f"Telegram: {user[1]}\n"
+                f"Username: @{user[2] if user[2] else 'N/A'}\n"
+                f"Deposit: ₦{user[3]:,.2f}\n"
+                f"Income: ₦{user[4]:,.2f}\n"
+                "────────────\n"
+            )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+
+async def admin_deposits(query):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, user_id, amount, method, status, created_at
+        FROM deposits
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+    deposits = cur.fetchall()
+    conn.close()
+
+    if not deposits:
+        text = "💰 Deposits\n\nNo deposits found."
+        keyboard = [
+            [InlineKeyboardButton(
+                "⬅️ Admin Menu",
+                callback_data="admin"
+            )]
+        ]
+    else:
+        text = "💰 Recent Deposits\n\n"
+        keyboard = []
+
+        for deposit in deposits:
+            deposit_id = deposit[0]
+            status = deposit[4]
+
+            text += (
+                f"ID: {deposit_id}\n"
+                f"User: {deposit[1]}\n"
+                f"Amount: ₦{deposit[2]:,.2f}\n"
+                f"Method: {deposit[3]}\n"
+                f"Status: {status}\n"
+                f"Date: {deposit[5]}\n"
+                "────────────\n"
+            )
+
+            if status == "pending":
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "✅ Approve",
+                        callback_data=f"approve_dep_{deposit_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Reject",
+                        callback_data=f"reject_dep_{deposit_id}"
+                    )
+                ])
+
+        keyboard.append([
+            InlineKeyboardButton(
+                "⬅️ Admin Menu",
+                callback_data="admin"
+            )
+        ])
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_withdrawals(query):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, user_id, amount, fee, net_amount, status, created_at
+        FROM withdrawals
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+    withdrawals = cur.fetchall()
+    conn.close()
+
+    if not withdrawals:
+        text = "💸 Withdrawals\n\nNo withdrawals found."
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Admin Menu", callback_data="admin")]
+        ]
+    else:
+        text = "💸 Recent Withdrawals\n\n"
+        keyboard = []
+
+        for withdrawal in withdrawals:
+            withdrawal_id = withdrawal[0]
+            status = withdrawal[5]
+
+            text += (
+                f"ID: {withdrawal_id}\n"
+                f"User: {withdrawal[1]}\n"
+                f"Amount: ₦{withdrawal[2]:,.2f}\n"
+                f"Fee: ₦{withdrawal[3]:,.2f}\n"
+                f"Net: ₦{withdrawal[4]:,.2f}\n"
+                f"Status: {status}\n"
+                f"Date: {withdrawal[6]}\n"
+                "────────────\n"
+            )
+
+            if status == "pending":
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "✅ Approve",
+                        callback_data=f"approve_wd_{withdrawal_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Reject",
+                        callback_data=f"reject_wd_{withdrawal_id}"
+                    )
+                ])
+
+        keyboard.append([
+            InlineKeyboardButton(
+                "⬅️ Admin Menu",
+                callback_data="admin"
+            )
+        ])
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def approve_withdrawal(query, withdrawal_id):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, amount, status
+        FROM withdrawals
+        WHERE id = ?
+    """, (withdrawal_id,))
+
+    withdrawal = cur.fetchone()
+
+    if not withdrawal:
+        conn.close()
+        await query.answer("Withdrawal not found.", show_alert=True)
+        return
+
+    user_id, amount, status = withdrawal
+
+    if status != "pending":
+        conn.close()
+        await query.answer(f"Already {status}.", show_alert=True)
+        return
+
+    cur.execute("""
+        UPDATE withdrawals
+        SET status = 'approved'
+        WHERE id = ?
+    """, (withdrawal_id,))
+
+    conn.commit()
+    conn.close()
+
+    await query.answer("Withdrawal approved.", show_alert=True)
+
+    await query.edit_message_text(
+        f"✅ Withdrawal Approved\n\n"
+        f"ID: {withdrawal_id}\n"
+        f"User: {user_id}\n"
+        f"Amount: ₦{amount:,.2f}",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def reject_withdrawal(query, withdrawal_id):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, amount, status
+        FROM withdrawals
+        WHERE id = ?
+    """, (withdrawal_id,))
+
+    withdrawal = cur.fetchone()
+
+    if not withdrawal:
+        conn.close()
+        await query.answer("Withdrawal not found.", show_alert=True)
+        return
+
+    user_id, amount, status = withdrawal
+
+    if status != "pending":
+        conn.close()
+        await query.answer(f"Already {status}.", show_alert=True)
+        return
+
+    cur.execute("""
+        UPDATE withdrawals
+        SET status = 'rejected'
+        WHERE id = ?
+    """, (withdrawal_id,))
+
+    cur.execute("""
+        UPDATE users
+        SET income_balance = income_balance + ?
+        WHERE user_id = ?
+    """, (amount, user_id))
+
+    conn.commit()
+    conn.close()
+
+    await query.answer("Withdrawal rejected.", show_alert=True)
+
+    await query.edit_message_text(
+        f"❌ Withdrawal Rejected\n\n"
+        f"ID: {withdrawal_id}\n"
+        f"User: {user_id}\n"
+        f"Amount refunded: ₦{amount:,.2f}",
+        reply_markup=admin_keyboard()
+    )
+
+async def approve_deposit(query, deposit_id):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, amount, status
+        FROM deposits
+        WHERE id = ?
+    """, (deposit_id,))
+
+    deposit = cur.fetchone()
+
+    if not deposit:
+        conn.close()
+        await query.answer("Deposit not found.", show_alert=True)
+        return
+
+    user_id, amount, status = deposit
+
+    if status != "pending":
+        conn.close()
+        await query.answer(f"Already {status}.", show_alert=True)
+        return
+
+    cur.execute("""
+        UPDATE deposits
+        SET status = 'approved'
+        WHERE id = ?
+    """, (deposit_id,))
+
+    cur.execute("""
+        UPDATE users
+        SET deposit_balance = deposit_balance + ?
+        WHERE user_id = ?
+    """, (amount, user_id))
+
+    conn.commit()
+    conn.close()
+
+    await query.answer("Deposit approved.", show_alert=True)
+
+    await query.edit_message_text(
+        f"✅ Deposit Approved\n\n"
+        f"ID: {deposit_id}\n"
+        f"User: {user_id}\n"
+        f"Amount: ₦{amount:,.2f}",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def reject_deposit(query, deposit_id):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, amount, status
+        FROM deposits
+        WHERE id = ?
+    """, (deposit_id,))
+
+    deposit = cur.fetchone()
+
+    if not deposit:
+        conn.close()
+        await query.answer("Deposit not found.", show_alert=True)
+        return
+
+    user_id, amount, status = deposit
+
+    if status != "pending":
+        conn.close()
+        await query.answer(f"Already {status}.", show_alert=True)
+        return
+
+    cur.execute("""
+        UPDATE deposits
+        SET status = 'rejected'
+        WHERE id = ?
+    """, (deposit_id,))
+
+    conn.commit()
+    conn.close()
+
+    await query.answer("Deposit rejected.", show_alert=True)
+
+    await query.edit_message_text(
+        f"❌ Deposit Rejected\n\n"
+        f"ID: {deposit_id}\n"
+        f"User: {user_id}\n"
+        f"Amount: ₦{amount:,.2f}",
+        reply_markup=admin_keyboard()
+    )
+
+async def admin_command(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Access denied.")
+        return
+
+    await update.message.reply_text(
+        "🛠 AuraVest Admin Dashboard",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def manual_amount_start(query, context):
+    context.user_data["awaiting_manual_amount"] = True
+
+    await query.edit_message_text(
+        "💵 Enter the exact amount you paid.\n\n"
+        "Example: 5000"
+    )
+
+async def clear_user_prompt(context):
+    message_id = context.user_data.pop("prompt_message_id", None)
+    chat_id = context.user_data.pop("prompt_chat_id", None)
+
+    if message_id and chat_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id
+            )
+        except Exception:
+            pass
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    await clear_user_prompt(context)
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    data = query.data
+
+    if data == "home":
+        await query.edit_message_text(
+            "🌟 AuraVest\n\nChoose an option:",
+            reply_markup=main_menu()
+        )
+        return
+
+    if data == "balance":
+        await show_balance(query)
+        return
+
+    if data == "deposit":
+        await show_deposit_menu(query)
+        return
+
+    if data == "automatic_deposit":
+        context.user_data["awaiting_automatic_amount"] = True
+        await automatic_deposit(query, context)
+        return
+
+    if data == "manual_deposit":
+        await manual_deposit(query)
+        return
+
+    if data == "manual_amount":
+        await manual_amount_start(query, context)
+        return
+
+    if data == "plans":
+        await show_plans(query)
+        return
+
+    if data == "orders":
+        await show_orders(query)
+        return
+
+    if data.startswith("plan_"):
+        amount = int(data.split("_")[1])
+        await buy_plan(query, amount)
+        return
+
+    if data == "refer":
+        await show_referral(query)
+        return
+
+    if data == "daily_checkin":
+        await daily_checkin(query)
+        return
+
+    if data == "withdraw":
+        context.user_data["awaiting_withdrawal_amount"] = True
+        await withdrawal_start(query)
+        return
+
+    if data == "admin_overview":
+        await admin_overview(query)
+        return
+
+    if data == "admin_deposits":
+        await admin_deposits(query)
+        return
+
+    if data == "admin_withdrawals":
+        await admin_withdrawals(query)
+        return
+
+    if data == "admin_users":
+        await admin_users(query)
+        return
+
+    if data.startswith("approve_dep_"):
+        await approve_deposit(query, int(data.split("_")[-1]))
+        return
+
+    if data.startswith("reject_dep_"):
+        await reject_deposit(query, int(data.split("_")[-1]))
+        return
+
+    if data.startswith("approve_wd_"):
+        await approve_withdrawal(query, int(data.split("_")[-1]))
+        return
+
+    if data.startswith("reject_wd_"):
+        await reject_withdrawal(query, int(data.split("_")[-1]))
+        return
+
+
+async def handle_manual_photo(update, context):
+    user_id = update.effective_user.id
+
+    amount = context.user_data.get("manual_deposit_amount")
+
+    if not amount:
+        await update.message.reply_text(
+            "❌ No pending manual deposit found.\n\n"
+            "Please start the deposit process again."
+        )
+        return
+
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO deposits
+        (user_id, amount, method, screenshot_file_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        amount,
+        "manual",
+        file_id,
+        "pending",
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+    context.user_data.pop("manual_deposit_amount", None)
+
+    await update.message.reply_text(
+        f"✅ Deposit submitted successfully!\n\n"
+        f"Amount: ₦{amount:,.2f}\n"
+        f"Status: Pending admin approval.\n\n"
+        f"Your deposit balance will be updated after verification."
+    )
+
+async def text_handler(update, context):
+    if not update.message:
+        return
+
+    text = update.message.text.strip()
+
+    # Manual deposit amount
+    if context.user_data.get("awaiting_manual_amount"):
+        try:
+            amount = float(text.replace(",", ""))
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Enter a valid amount.\n\n"
+                "Example: 5000"
+            )
+            return
+
+        if amount <= 0:
+            await update.message.reply_text(
+                "❌ Amount must be greater than zero."
+            )
+            return
+
+        context.user_data["manual_deposit_amount"] = amount
+        context.user_data.pop("awaiting_manual_amount", None)
+
+        await update.message.reply_text(
+            f"💵 Amount: ₦{amount:,.2f}\n\n"
+            "📸 Now send your payment screenshot/photo."
+        )
+        return
+
+    # Withdrawal amount
+    if context.user_data.get("awaiting_withdrawal_amount"):
+        await withdrawal_amount(update, context)
+        return
+
+    # Automatic deposit amount
+    if context.user_data.get("awaiting_automatic_amount"):
+        await automatic_amount(update, context)
+        return
+def main():
+    init_db()
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_command))
+
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    app.add_handler(
+        MessageHandler(filters.PHOTO, handle_manual_photo)
+    )
+
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    )
+
+    print("AuraVest bot is running...")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
